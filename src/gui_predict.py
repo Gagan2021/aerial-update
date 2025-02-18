@@ -8,6 +8,14 @@ import numpy as np
 import tkinter as tk
 from tkinter import filedialog
 
+# Try to import tkinterdnd2 for drag and drop support.
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    TK_ROOT_CLASS = TkinterDnD.Tk
+except ImportError:
+    TK_ROOT_CLASS = tk.Tk
+    DND_FILES = None
+
 # -------------------------------
 # GradCAM Implementation
 # -------------------------------
@@ -100,121 +108,146 @@ def load_filtered_state_dict(model, checkpoint_path, device):
     model.load_state_dict(model_dict)
 
 # -------------------------------
-# Main Functionality with GUI
+# GUI Application Class
 # -------------------------------
-def main():
-    # Device configuration: use GPU if available, otherwise CPU
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+class App:
+    def __init__(self):
+        # Create the main window (using TkinterDnD if available for drag-and-drop)
+        self.root = TK_ROOT_CLASS()
+        self.root.title("Aerial Activity Predictor")
+        self.root.geometry("400x200")
+        
+        # Device configuration: use GPU if available, otherwise CPU
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Define class names (order must match training)
+        self.class_names = [
+            "parasailing",
+            "sky diving"
+        ]
+        num_classes = len(self.class_names)
 
-    # Define class names (order must match training)
-    class_names = [
-        "parasailing",
-        "sky diving"
-    ]
-    num_classes = len(class_names)
+        # -------------------------------
+        # Load the Trained Model
+        # -------------------------------
+        # Create a ResNet18 model instance and update the final layer.
+        # (Do not load pre-trained weights; we load our custom checkpoint below.)
+        self.model = models.resnet18(weights=None)
+        self.model.fc = torch.nn.Linear(self.model.fc.in_features, num_classes)
+        model_path = "../models/aerial_activity_detector.pth"  # Adjust the path if necessary
+        
+        # Load checkpoint using the filtered loader to skip mismatches
+        load_filtered_state_dict(self.model, model_path, self.device)
+        self.model = self.model.to(self.device)
+        self.model.eval()
 
-    # -------------------------------
-    # Load the Trained Model
-    # -------------------------------
-    # Create a ResNet18 model instance and update the final layer
-    # (Do not load pre-trained weights; we load our custom checkpoint below.)
-    model = models.resnet18(weights=None)
-    model.fc = torch.nn.Linear(model.fc.in_features, num_classes)
-    model_path = "../models/aerial_activity_detector.pth"  # Adjust the path if necessary
-    
-    # Load checkpoint using the filtered loader to skip mismatches
-    load_filtered_state_dict(model, model_path, device)
-    model = model.to(device)
-    model.eval()
+        # Select the Target Layer for GradCAM (for ResNet18, choose one of the later conv layers)
+        self.target_layer = self.model.layer4[1].conv2  # Adjust as needed
 
-    # -------------------------------
-    # Select the Target Layer for GradCAM
-    # -------------------------------
-    # For ResNet18, choose one of the later convolutional layers
-    target_layer = model.layer4[1].conv2  # Adjust as needed
-    gradcam = GradCAM(model, target_layer)
+        # Preprocessing transformation for input images
+        self.preprocess = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+        ])
 
-    # -------------------------------
-    # Open File Dialog to Choose an Image
-    # -------------------------------
-    root = tk.Tk()
-    root.withdraw()  # Hide the main window
-    file_path = filedialog.askopenfilename(
-        title="Select an Image",
-        filetypes=[("Image Files", "*.jpg;*.jpeg;*.png")]
-    )
-    if not file_path:
-        print("No file selected. Exiting.")
-        return
+        # -------------------------------
+        # Build the GUI
+        # -------------------------------
+        # Label to instruct user for drag-and-drop
+        self.drop_label = tk.Label(self.root, text="Drag and drop an image file here", relief="groove", width=40, height=5)
+        self.drop_label.pack(pady=20)
+        # Register drop target if drag-and-drop is supported
+        if DND_FILES:
+            self.drop_label.drop_target_register(DND_FILES)
+            self.drop_label.dnd_bind('<<Drop>>', self.on_drop)
 
-    # -------------------------------
-    # Preprocess the Image
-    # -------------------------------
-    orig_image = Image.open(file_path).convert("RGB")
-    preprocess = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
-    ])
-    input_tensor = preprocess(orig_image).unsqueeze(0).to(device)
+        # Button to open file dialog
+        self.select_button = tk.Button(self.root, text="Select Image", command=self.select_file)
+        self.select_button.pack(pady=10)
 
-    # -------------------------------
-    # Generate GradCAM Heatmap and Prediction
-    # -------------------------------
-    cam, output = gradcam.generate(input_tensor)
-    probs = torch.softmax(output, dim=1)
-    confidence, pred_idx = torch.max(probs, dim=1)
-    predicted_class = class_names[pred_idx.item()]
-    confidence_value = confidence.item() * 100
+        self.root.mainloop()
 
-    # -------------------------------
-    # Prepare the Heatmap and Find a Bounding Box
-    # -------------------------------
-    # Resize the heatmap to match the original image size
-    cam_resized = cv2.resize(cam, (orig_image.width, orig_image.height))
-    heatmap = np.uint8(255 * cam_resized)
-    heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+    def select_file(self):
+        file_path = filedialog.askopenfilename(
+            title="Select an Image",
+            filetypes=[("Image Files", "*.jpg;*.jpeg;*.png")]
+        )
+        if file_path:
+            self.process_image(file_path)
 
-    # Convert the original PIL image to an OpenCV BGR image
-    orig_np = np.array(orig_image)
-    orig_np = cv2.cvtColor(orig_np, cv2.COLOR_RGB2BGR)
+    def on_drop(self, event):
+        # event.data may contain one or more file paths; take the first one.
+        file_path = event.data
+        # Remove curly braces (common when file paths contain spaces)
+        if file_path.startswith("{") and file_path.endswith("}"):
+            file_path = file_path[1:-1]
+        # In case of multiple files, select the first one.
+        file_path = file_path.split()[0]
+        self.process_image(file_path)
 
-    # Blend the heatmap with the original image to create an overlay
-    overlay = cv2.addWeighted(orig_np, 0.5, heatmap_color, 0.5, 0)
+    def process_image(self, file_path):
+        print("Processing file:", file_path)
+        try:
+            orig_image = Image.open(file_path).convert("RGB")
+        except Exception as e:
+            print("Error opening image:", e)
+            return
 
-    # Threshold the heatmap to create a binary mask for salient regions
-    ret, mask = cv2.threshold(heatmap, 100, 255, cv2.THRESH_BINARY)
-    mask = np.uint8(mask)
-    # Find contours in the binary mask
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        # Choose the largest contour as the primary region
-        largest_contour = max(contours, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(largest_contour)
-        # Draw the bounding box around the detected region
-        cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        # Annotate the image with predicted class and confidence
-        text = f"{predicted_class}: {confidence_value:.2f}%"
-        cv2.putText(overlay, text, (x, max(y - 10, 20)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-    else:
-        # If no salient region is found, annotate on the image top-left
-        text = f"{predicted_class}: {confidence_value:.2f}%"
-        cv2.putText(overlay, text, (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        # Preprocess the image
+        input_tensor = self.preprocess(orig_image).unsqueeze(0).to(self.device)
+        
+        # Create a new GradCAM instance (so hooks are freshly registered)
+        gradcam = GradCAM(self.model, self.target_layer)
+        cam, output = gradcam.generate(input_tensor)
+        probs = torch.softmax(output, dim=1)
+        confidence, pred_idx = torch.max(probs, dim=1)
+        predicted_class = self.class_names[pred_idx.item()]
+        confidence_value = confidence.item() * 100
 
-    # -------------------------------
-    # Display the Result in a 500x500 Window
-    # -------------------------------
-    cv2.namedWindow("Aerial Activity Prediction", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Aerial Activity Prediction", 500, 500)
-    cv2.imshow("Aerial Activity Prediction", overlay)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+        # Prepare the heatmap and overlay
+        cam_resized = cv2.resize(cam, (orig_image.width, orig_image.height))
+        heatmap = np.uint8(255 * cam_resized)
+        heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
 
-    # Clean up GradCAM hooks
-    gradcam.remove_hooks()
+        # Convert the original PIL image to an OpenCV BGR image
+        orig_np = np.array(orig_image)
+        orig_np = cv2.cvtColor(orig_np, cv2.COLOR_RGB2BGR)
+
+        # Blend the heatmap with the original image to create an overlay
+        overlay = cv2.addWeighted(orig_np, 0.5, heatmap_color, 0.5, 0)
+
+        # Threshold the heatmap to create a binary mask for salient regions
+        ret, mask = cv2.threshold(heatmap, 100, 255, cv2.THRESH_BINARY)
+        mask = np.uint8(mask)
+        # Find contours in the binary mask
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            # Choose the largest contour as the primary region
+            largest_contour = max(contours, key=cv2.contourArea)
+            x, y, w, h = cv2.boundingRect(largest_contour)
+            # Draw the bounding box around the detected region
+            cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            # Annotate the image with predicted class and confidence
+            text = f"{predicted_class}: {confidence_value:.2f}%"
+            cv2.putText(overlay, text, (x, max(y - 10, 20)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        else:
+            # If no salient region is found, annotate on the top-left of the image
+            text = f"{predicted_class}: {confidence_value:.2f}%"
+            cv2.putText(overlay, text, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+        # Display the result in a 500x500 window
+        cv2.namedWindow("Aerial Activity Prediction", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Aerial Activity Prediction", 500, 500)
+        cv2.imshow("Aerial Activity Prediction", overlay)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+        # Clean up the GradCAM hooks for this prediction
+        gradcam.remove_hooks()
 
 if __name__ == "__main__":
-    main()
+    App()
