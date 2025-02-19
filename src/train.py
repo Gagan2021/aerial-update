@@ -7,7 +7,7 @@ from torchvision import models
 
 from utils import get_data_loaders, set_seed
 
-def train_model(data_dir, model_save_path, epochs=30, batch_size=32, learning_rate=0.0005, img_size=224, num_workers=8):
+def train_model(data_dir, model_save_path, epochs=100, batch_size=32, learning_rate=0.0001, img_size=224, num_workers=8):
     # Set seed for reproducibility
     set_seed(42)
     

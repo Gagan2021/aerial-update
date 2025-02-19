@@ -159,7 +159,7 @@ def main():
     #        image1.jpg, ...
     #    class2/
     #        image1.jpg, ...
-    data_dir = "../output_data"  # Adjust path if needed
+    data_dir = "../data"  # Adjust path if needed
 
     # Load the full dataset
     full_dataset = datasets.ImageFolder(data_dir, transform=train_transforms)

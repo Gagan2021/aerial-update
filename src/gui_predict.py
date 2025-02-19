@@ -122,6 +122,8 @@ class App:
         
         # Define class names (order must match training)
         self.class_names = [
+            "helicopter",
+            "paragliding",
             "parasailing",
             "sky diving"
         ]
